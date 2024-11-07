@@ -1,1 +1,2 @@
 # School-Websites-Scrapper
+ignore
