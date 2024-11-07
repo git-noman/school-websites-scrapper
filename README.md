@@ -1,2 +1,2 @@
-# School-Websites-Scrapper
+# school-websites-scrapper
 ignore
