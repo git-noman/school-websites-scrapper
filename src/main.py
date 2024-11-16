@@ -9,10 +9,15 @@ from selenium.webdriver.common.by import By
 import spacy
 from spacy.cli import download
 
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from time import sleep
+import time
 from io import StringIO
 import numpy as np
 import json
+import traceback
+
+import pymysql
 
 
 ### Preload code
@@ -106,10 +111,12 @@ class Utility:
         # key = 'Job Title' etc
         # value = 'Principal' etc
         bundle = []
-        lowkey = key.lower()
-        lowvalue = value.lower()
+        lowkey = str(key).lower()
+        lowvalue = str(value).lower()
 
         if "title" in lowkey:
+            key = "Honorific"
+        if "position" in lowkey:
             key = "Honorific"
         
         bundle.append(key)
@@ -122,15 +129,16 @@ class Utility:
         bundle = []
         first_name = None
         last_name = None
+        name = str(name) # float? convert that shi
         # Lastname, Firstname
         if "," in name:
-            last_name, first_name = name.split(",")
+            last_name, first_name = name.split(",",1)
         # Firstname Lastname
         elif " " in name:
-            first_name, last_name = name.split(" ")
+            first_name, last_name = name.split(" ",1)
         # mr/mrs.name
         elif "." in name:
-            first_name, last_name = name.split(".")
+            first_name, last_name = name.split(".",1)
         else:
             first_name, last_name = name, name
 
@@ -273,6 +281,7 @@ class Parser:
 
         new_data = {}
         name_key = list(data.keys())[0]
+
         for pos, name in data[name_key].items():
             # name = elizabeth shaddix
             # key = pos
@@ -288,7 +297,6 @@ class Parser:
 
             new_data[name] = values_to_assign
 
-        
         return new_data
 
     def process_implications(table, id):
@@ -305,6 +313,7 @@ class Parser:
             State
             School Name
         """
+
         if not table:
             return
         ## Fetch relevant data
@@ -318,7 +327,6 @@ class Parser:
         temp = BeautifulSoup(resp.content, 'html.parser')
 
         school_name = temp.find(id="firstHeading").string
-
         ## Append that data
         for entry in table:
             entry["School District"] = district
@@ -326,6 +334,7 @@ class Parser:
 
             # also add filler/common parameters
             entry["State"] = "Alabama"
+
 
         return table
 
@@ -376,6 +385,7 @@ class Parser:
                 entry[processed_k] = processed_v
 
 
+
             data.append(entry)
 
         # Add implicational parameters
@@ -401,8 +411,12 @@ class Extractor:
         # process srcs by opening them, turning them into dataframe tables thru pandas
         # and then append them to the `tables` variable
         for src in srcs:
-            if "googletag" in src:
-                print(f"{colors.OKBLUE}ignoring {src} {colors.ENDC}")
+            temp_logic = False
+            for blocked in ["googletag", "youtube", "canva"]:
+                if blocked in src:
+                    print(f"{colors.WARNING}ignoring {src} {colors.ENDC}")
+                    temp_logic = True
+            if temp_logic:
                 continue
 
             html = Utility.get_selenium(src)
@@ -415,9 +429,19 @@ class Extractor:
                 tables.append(df)
 
         return tables
+    
+    # Instead of finding tables in iframe links, find them directly on the webpage.
+    def extr_table(soup) -> list:
+        tables_inpage = soup.find_all('table')
+        tables = []
+        for table in tables_inpage:
+            df = TableUtil.table_into_df(table)
+            tables.append(df)
+
+        return tables
 
     def extr_match(url):
-        # This is a list of pattern specifications. The "match" key is an XPath
+        # this is a list of pattern specifications. The "match" key is an XPath
         # expression that identifies a top-level element that contains both the name
         # and email address. The "name" and "email" keys are callables that when
         # evaluated on the matched element return the desired data.
@@ -488,6 +512,58 @@ class Extractor:
 
 
 
+## SQL DB Management Class
+class DBManager:
+    db_config = {
+        "host": "localhost",
+        "user": "root",
+        "password": "",
+        "database": "faculty_data"
+    }
+
+    # Connect to db
+    def connect():
+        return pymysql.connect(**DBManager.db_config)
+    
+    # Generate table name
+    # Filler function (yet). Added for programmer's ease
+    def generate_table_name(url):
+        return str(url)
+    
+    # Dynamically create a table
+    def create_table(connection, table_name, columns):
+        with connection.cursor() as cursor:
+            # Dynamically construct the CREATE TABLE query
+            column_definitions = ", ".join([f"`{col}` TEXT" for col in columns])
+            sql_query = f"CREATE TABLE IF NOT EXISTS `{table_name}` ({column_definitions});"
+            cursor.execute(sql_query)
+    
+    # Insert faculty data
+    def insert_data(connection, table_name, data):
+        with connection.cursor() as cursor:
+            for entry_list in data:
+                for entry in entry_list:
+                    columns = ", ".join([f"`{col}`" for col in entry.keys()])
+                    placeholders = ", ".join(["%s"] * len(entry))
+                    sql_query = f"INSERT INTO `{table_name}` ({columns}) VALUES ({placeholders});"
+                    cursor.execute(sql_query, list(entry.values()))
+
+
+    # Wrapper
+    def process_data(url, data):
+        connection = DBManager.connect()
+        if not data:
+            return
+        
+        table_name = DBManager.generate_table_name(url)
+        columns = data[0][0].keys()
+
+        DBManager.create_table(connection, table_name, columns)
+        DBManager.insert_data(connection, table_name, data)
+
+        connection.commit()
+        connection.close()
+
 
 
     
@@ -508,7 +584,31 @@ class Scrapper:
 
         self.parsed = []
 
+    ## Scrapper Util
+    # data handler
+    def handle_data(self, url, data: list):
+        """
+        `data` should be a list containing tables.
+        Make sure the `payload` from `scrape` is being passed. 
+        """
+        # pass to DBManager
+        DBManager.process_data(url, data)
 
+
+    # save pos to config.json 
+    def save_pos(self, con_dict, pos):
+        with open("config.json", "w") as f:
+            con_dict["cache"] = pos
+            f.write(json.dumps(con_dict))
+
+    # save error in errors.json
+    def save_error(self, pos, error):
+        with open("errors.json", "r") as f:
+            error_dict = json.loads(f.read())
+
+        with open("errors.json", "w"):
+            error_dict[str(pos)] = str(error)
+            f.write(json.dumps(error_dict))
 
     ## Finders
 
@@ -545,7 +645,7 @@ class Scrapper:
         Returns:
             A list of strings containing directories, but not full URLs
         """
-        keywords = ['staff', 'faculty', 'teachers', 'board', 'department']
+        keywords = ['staff', 'faculty', 'teachers']
         links = soup.find_all('a', href=True)
 
         directories = []
@@ -573,7 +673,10 @@ class Scrapper:
 
         # iframe method
         data = Extractor.extr_iframe(soup)
+        if not data: # Extractor.extr_iframe didnt work? no worries
+            data = Extractor.extr_table(soup)
 
+        # filter `data` tables with TableUtil.is_relevant
         if check:
             new_data = []
             for table in data:
@@ -585,7 +688,7 @@ class Scrapper:
 
         return data
 
-    def scrape(self, url, id, **kwargs):
+    def scrape(self, url, pos, **kwargs):
         """
         Wrapper over the Scrapper class methods.
         Scrapes a single school website and multiple sub-websites and directories within it (if any).
@@ -597,28 +700,27 @@ class Scrapper:
 
         """
         # Handle kwargs
-        silent = kwargs.get("silent", False) # for errors
+        silent = kwargs.get("silent", False) # for errors/warnings/data info
         log_info = kwargs.get("log_info", True) # for info
 
-        if not silent:
-            print(f"{colors.HEADER}{colors.UNDERLINE}SCRAPPING{colors.ENDC}:{colors.HEADER} {url} {colors.ENDC}")
+        print(f"{colors.HEADER}{colors.UNDERLINE}SCRAPPING{colors.ENDC}:{colors.HEADER} {url} {colors.ENDC}")
 
         # Collect subwebsites
         try:
             soup = Utility.get_soup(url)
             subwebsites = self.find_subwebsites(soup)
         except Exception as e:
-            if not silent:
-                print(f'{colors.FAIL}Scrapper: Couldnt scrap {url} :\n{e}\n{colors.ENDC}')
+            print(f'{colors.FAIL}Scrapper: Couldnt scrap {url} :\n{e}\n{colors.ENDC}')
             return
         
         # Finding subwebsite directories
+        # aka collecting faculty/staff directories in the subwebsites
         directories = []
         for subwebsite in subwebsites:
             try:
                 subw_soup = Utility.get_soup(subwebsite)
-                if not silent:
-                    print(f"{colors.OKBLUE}finding staff directories in: {subwebsite} {colors.ENDC}")
+                print(f"{colors.OKBLUE}finding staff directories in: {subwebsite} {colors.ENDC}")
+
                 halflinks = self.find_directories(subw_soup) # halflinks of directories
                 subw_directories = Utility.directories_to_urls(subwebsite, halflinks) # turn halflinks into urls
 
@@ -630,39 +732,40 @@ class Scrapper:
                     directories.append(d)
 
             except Exception as e:
-                if not silent:
-                    print(f'{colors.FAIL}Scrapper: Couldnt scrape subwebsite {subwebsite}\nReason: {e} {colors.ENDC}')
+                print(f'{colors.FAIL}Scrapper: Couldnt find directories in subwebsite {subwebsite}\nReason: {e} {colors.ENDC}')
 
         if directories:
-            print(f"\n{colors.OKGREEN}Collected directories, now scrapping them\n{colors.ENDC}")
+            print(f"\n{colors.OKGREEN}Collected directories, now scrapping them\nTotal dirs found: {len(directories)}\n{colors.ENDC}")
 
         # Get staff/faculty data from directories
-        # then return in payload
+        # then append to payload
         payload = [] # return
+
         try:
             for d_url in directories:
                 d_soup = Utility.get_soup(d_url)
-                if not silent:
-                    print(f"{colors.OKBLUE}scrapping directory: {d_url} {colors.ENDC}")
+                print(f"{colors.OKBLUE}scrapping directory: {d_url} {colors.ENDC}")
                 
                 dataframes = self.find_staff(d_soup)
 
                 for df in dataframes:
+
                     parsed = Parser.parse_table(df)
-                    processed = Parser.process_into_parameters(parsed, id)
+                    processed = Parser.process_into_parameters(parsed, pos)
                     payload.append(processed)
 
 
-            if not silent:
-                print(f"{colors.HEADER}Tables scrapped:{len(payload)}")
-
-            return payload
-
+            print(f"{colors.HEADER}Tables scrapped:{len(payload)}")
         except Exception as e:
-            if directories:
-                print(f"{colors.FAIL}Couldnt scrape directory: {d_url}\nReason: {e} {colors.ENDC}")
+            if not directories:
+                return
+            
+            print(f"{colors.FAIL}Couldnt scrape directory: {d_url}\nReason: {traceback.format_exc()} {colors.ENDC}")
+            # log to errors.json
+            self.save_error(pos, e)
 
-
+        # finally we return the payload
+        return payload
 
 
 
@@ -673,7 +776,6 @@ class Scrapper:
 
         `save` is for saving the result to an external file or db
         """
-        silent = kwargs.get("silent", False)
         save = kwargs.get("save", True)
 
         # start from where it left
@@ -685,54 +787,130 @@ class Scrapper:
         pos = 1 # pos of url currently iterating on
 
         for url in urls:
-
             if pos >= left_at:
-                result = self.scrape(url, pos) # -> payload
-                # save to files
-                if save:
-                    # save result if available
-                    if result:
-                        with open("data.json", "r") as f:
-                            data_dict = json.loads(f.read())
-                        with open("data.json", "w") as f:
-                            data_dict[url] = result
-                            f.write(f"\n{json.dumps(data_dict)}\n")
+                result = self.scrape(url, pos, save=save) # -> payload
+
+                # pass to handler if save=True and result is available
+                if save and result:
+                        self.handle_data(url, result)
 
                 # save pos to remember where to start from next time
-                with open("config.json", "w") as f:
-                    con_dict["cache"] = pos
-                    f.write(json.dumps(con_dict))
-                pos += 1
+                self.save_pos(con_dict, pos)
+
             else:
-                pos += 1
-                continue
+                pass
+
+            # run at all times
+            pos += 1
 
 
+    
+    def concurrent_scrapes(self, **kwargs):
+        """
+        Experimental concurrent alternative to Scrapper.scrapes
+        -- FIX --
+        """
+        save = kwargs.get("save", False)
 
+        # get where it left
+        with open("config.json", "r") as f:
+            con_dict = json.loads(f.read())
 
+        left_at = con_dict["cache"] # pos of url that we left at
+        pos = 1 # pos of url currently iterating on
 
+        futures = []
+        for url in urls:
+            if pos >= left_at:
+                with ProcessPoolExecutor(max_workers=20) as executor:
+                    future = executor.submit(self.scrape, url, pos)
+                    futures.append(future)
+
+                    self.save_pos(con_dict, pos)
+
+            else:
+                pass
+
+            if len(futures) % 5 == 0:
+                results = [future.result() for future in futures]
+                print(f"results = {results}")        
+            pos += 1
 
 ### Main
 ## Console Interface
 def console():
     scrapper = Scrapper()
-    msg = f"{colors.OKCYAN}webscrapper Console\n{colors.UNDERLINE}COMMANDS{colors.ENDC}{colors.OKCYAN}:\n1) start : start the webscrapper\n2) reset cache : reset count and start from pos 1\n3) reset data : reset data.json"
+    save = True # True for default, False for debug mode
+    concurrent = False
+
+    msg = f"{colors.OKCYAN}webscrapper Console\n{colors.UNDERLINE}COMMANDS{colors.ENDC}{colors.OKCYAN}:\n1) start : start the webscrapper\n2) reset pos : reset count and start from pos 1\n3) reset data : reset data.json\n4) mode -[debug, default] : debug mode turns off save\n5) concurrent -[on, off]{colors.ENDC}"
     print(msg)
-    while True:
-        com = input(">>>").lower()
+
+    def update_pos():
+        with open("config.json", "r") as f:
+            return int(json.loads(f.read())["cache"])
+    
+    while True: # command loop
+        com = input(">>>").lower() # command
+
+        pos = update_pos()
 
         if com == "start":
-            scrapper.scrapes()
-        elif com == "reset cache":
+            pos = update_pos()
+            print(f"Webscrapper starting from pos {pos}")
+            conc_human = "off"
+            if concurrent:
+                conc_human = "on"
+            print(f"Concurrency: {conc_human}")
+
+            if concurrent:
+                scrapper.concurrent_scrapes(save=save)
+            else:
+                scrapper.scrapes(save=save)
+
+        elif com == "reset pos":
+            pos = update_pos()
+
             with open("config.json", "w") as f:
                 f.write(json.dumps({"cache": 1}))
+
+            print(f"Success. Previous pos: {pos}")
+
         elif com == "reset data":
             with open("data.json", "w") as f:
-                f.write(json.dumps({}))
+                print("You are about to erase all contents in data.json. Are you sure? [y/n]")
+                confirm = input(">>>").lower()
+                if confirm == "y":
+                    f.write(json.dumps({}))
+                    print("Success.")
+                else:
+                    print("Exited.")
+
+        elif com == "mode":
+            print(f"default/`save`: {save}")
+        elif com == "mode -debug":
+            save = False
+        elif com == "mode -default":
+            save = True
+
+        elif com == "concurrent":
+            print(f"concurrent: {concurrent}")
+        elif com == "concurrent -on":
+            concurrent = True
+            save = False
+        elif com == "concurrent -off":
+            concurrent = False
+            save = True
         else:
             print(f"{colors.FAIL}Unknown command '{com}'{colors.ENDC}")
 
-console()
+
+if __name__ == "__main__":
+    scrapper = Scrapper()
+    scrapper.scrapes()
+
+
+
 """
 todo
 NER method
